@@ -17,6 +17,7 @@ from .cmd_run import Run
 from .cmd_clean import Clean
 from .cmd_list import List
 from .cmd_info import Info
+from .cmd_explain import Explain
 from .cmd_forget import Forget
 from .cmd_ignore import Ignore
 from .cmd_dumpdb import DumpDB
@@ -153,7 +154,7 @@ class DoitConfig():
 class DoitMain:
     # core doit commands
     BIN_NAME = os.path.split(sys.argv[0])[-1]
-    DOIT_CMDS = (Help, Run, List, Info, Clean, Forget, Ignore, DumpDB,
+    DOIT_CMDS = (Help, Run, List, Info, Explain, Clean, Forget, Ignore, DumpDB,
                  Strace, TabCompletion, ResetDep)
 
     def __init__(self, task_loader=None,

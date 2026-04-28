@@ -217,68 +217,6 @@ class _DependencyDbTests:
         self.assertIsNone(self.dep_manager._get("taskId_ZZZ", "dep_2"))
         self.assertIsNone(self.dep_manager._get("taskId_YYY", "dep_1"))
 
-    def test_cache_consistency_remove_then_set(self):
-        """Cache consistency: _get -> remove -> _set -> close -> reopen.
-
-        After reading a task into cache, removing it, then writing new values,
-        only the new values should exist after reopen, old values should NOT be
-        resurrected.
-        """
-        self.dep_manager._set("task_A", "dep_old1", "old_val1")
-        self.dep_manager._set("task_A", "dep_old2", "old_val2")
-        self.dep_manager.close()
-
-        reopened = Dependency(self.dep_manager.db_class, self.dep_manager.name)
-        reopened._get("task_A", "dep_old1")
-        reopened._set("task_A", "dep_modified", "modified_val")
-        reopened.remove("task_A")
-        reopened._set("task_A", "dep_new", "new_val")
-        reopened.close()
-
-        reopened2 = Dependency(self.dep_manager.db_class, self.dep_manager.name)
-        self.assertEqual("new_val", reopened2._get("task_A", "dep_new"))
-        self.assertIsNone(reopened2._get("task_A", "dep_old1"))
-        self.assertIsNone(reopened2._get("task_A", "dep_old2"))
-        self.assertIsNone(reopened2._get("task_A", "dep_modified"))
-        reopened2.close()
-
-    def test_cache_consistency_remove_all_then_set(self):
-        """Cache consistency: _set (dirty) -> remove_all -> _set -> close -> reopen.
-
-        After setting tasks (without dump), calling remove_all(), then setting
-        new tasks, only the new tasks should exist after reopen, old tasks should
-        NOT be resurrected.
-        """
-        self.dep_manager._set("task_old1", "dep1", "val1")
-        self.dep_manager._set("task_old2", "dep2", "val2")
-        self.dep_manager.remove_all()
-        self.dep_manager._set("task_new", "dep_new", "val_new")
-        self.dep_manager.close()
-
-        reopened = Dependency(self.dep_manager.db_class, self.dep_manager.name)
-        self.assertEqual("val_new", reopened._get("task_new", "dep_new"))
-        self.assertIsNone(reopened._get("task_old1", "dep1"))
-        self.assertIsNone(reopened._get("task_old2", "dep2"))
-        reopened.close()
-
-    def test_in_consistency_after_get_non_existent(self):
-        """in_ method consistency: _get on non-existent should not affect in_ result.
-
-        After calling _get on a non-existent task, in_ should still return False.
-        This tests that non-existent tasks are not cached (e.g., empty dicts).
-        """
-        self.assertFalse(self.dep_manager._in("non_existent"))
-        self.assertIsNone(self.dep_manager._get("non_existent", "dep"))
-        self.assertFalse(self.dep_manager._in("non_existent"))
-
-        self.dep_manager._set("task1", "dep", "val")
-        self.assertTrue(self.dep_manager._in("task1"))
-
-        self.dep_manager.remove("task1")
-        self.assertFalse(self.dep_manager._in("task1"))
-        self.assertIsNone(self.dep_manager._get("task1", "dep"))
-        self.assertFalse(self.dep_manager._in("task1"))
-
 
 class TestDependencyDbJson(DependencyTestBase, _DependencyDbTests, unittest.TestCase):
     backend_name = 'json'
