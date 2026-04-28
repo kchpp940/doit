@@ -232,10 +232,9 @@ class DbmDB:
 
     def remove_all(self):
         """remove saved dependencies from DB for all tasks"""
+        for key in list(self._dbm.keys()):
+            del self._dbm[key]
         self._db = {}
-        self._dbm.close()
-        del self._dbm
-        self._dbm = self.module.open(self.name, 'n')
         self.dirty = set()
 
 
@@ -298,13 +297,16 @@ class SqliteDB:
         if task_id in self._cache:
             return self._cache[task_id].get(dependency, None)
         else:
-            data = self._cache[task_id] = self._get_task_data(task_id)
+            data = self._get_task_data(task_id)
+            if data is None:
+                return None
+            self._cache[task_id] = data
             return data.get(dependency, None)
 
     def _get_task_data(self, task_id):
         data = self._conn.execute('select task_data from doit where task_id=?',
                                   (task_id,)).fetchone()
-        return data['task_data'] if data else {}
+        return data['task_data'] if data else None
 
     def set(self, task_id, dependency, value):
         """Store value in the DB."""
