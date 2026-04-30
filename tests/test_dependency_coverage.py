@@ -183,6 +183,64 @@ class DependencyCoverageTestBase:
             msg or f"Task '{task_name}' should NOT be in dependency DB"
         )
 
+    def _normalize_backend_name(self, backend_name):
+        """Convert harness backend name to CLI backend name.
+
+        The harness uses 'dbm.gnu', 'dbm.ndbm', 'dbm.dumb' but the CLI
+        uses just 'dbm'. This handles the conversion.
+        """
+        if backend_name.startswith('dbm.'):
+            return 'dbm'
+        return backend_name
+
+    def _run_cmd_via_parse_execute(self, cmd_cls, task_list, args=None, outstream=None):
+        """Run a command via parse_execute path.
+
+        This is a more realistic test path than calling _execute directly.
+        It tests:
+        - Command line argument parsing
+        - Loader setup and task loading
+        - dep_manager creation (if not provided)
+        - Actual command execution
+
+        Args:
+            cmd_cls: Command class (Run, List, Info, Forget, etc.)
+            task_list: List of Task objects
+            args: Command line arguments (e.g., ['task1'], ['--status'], etc.)
+            outstream: Optional output stream (default: StringIO)
+
+        Returns:
+            tuple: (result, outstream, cmd)
+                - result: Result from parse_execute
+                - outstream: The output stream used
+                - cmd: The command object created
+        """
+        from tests.support import FixedTaskLoader, CmdFactory
+
+        if args is None:
+            args = []
+        if outstream is None:
+            outstream = StringIO()
+
+        loader = FixedTaskLoader(task_list)
+
+        cmd = CmdFactory(
+            cmd_cls,
+            outstream=outstream,
+            task_loader=loader,
+            dep_file=self._dep_name,
+            dep_manager=self.dep_manager,
+        )
+
+        normalized_backend = self._normalize_backend_name(self.backend_name)
+        full_args = [
+            '--db-file', self._dep_name,
+            '--backend', normalized_backend,
+        ] + args
+
+        result = cmd.parse_execute(full_args)
+        return result, outstream, cmd
+
 
 # ===========================================================================
 # CATEGORY 1: BACKEND_* - Low-level backend behavior tests
@@ -981,37 +1039,21 @@ class _CommandRunSuccess(DependencyCoverageTestBase):
     REGRESSION: 成功 run 后 reopen 是 up-to-date.
     """
 
-    def _create_run_cmd(self, task_list, sel_tasks=None):
-        """Helper to create a Run command via CmdFactory.
-
-        Uses self.dep_manager directly instead of creating a new one,
-        to ensure state consistency.
-        """
-        from doit.cmd_run import Run
-        from tests.support import CmdFactory
-
-        output = StringIO()
-        cmd_run = CmdFactory(
-            Run,
-            outstream=output,
-            dep_file=self._dep_name,
-            dep_manager=self.dep_manager,
-            task_list=task_list,
-            sel_tasks=sel_tasks or [t.name for t in task_list]
-        )
-        return cmd_run, output
-
     def test_cmd_run_success_persists(self):
         """COMMAND: Run command success persists after close/reopen.
 
-        This tests the REAL command entry point, not just direct Runner calls.
+        This tests the REAL command entry point via parse_execute,
+        not just direct _execute calls.
         """
+        from doit.cmd_run import Run
+
         dep_file = self.create_file('dep.txt', 'content')
         task = self.create_task('task1', file_dep=[dep_file])
 
-        cmd_run, output = self._create_run_cmd([task])
-        result = cmd_run._execute(output)
-        self.assertEqual(0, result)
+        result1, output1, cmd1 = self._run_cmd_via_parse_execute(
+            Run, [task], ['task1']
+        )
+        self.assertEqual(0, result1)
 
         self.reopen_dep()
 
@@ -1021,19 +1063,26 @@ class _CommandRunSuccess(DependencyCoverageTestBase):
         self.assertEqual('up-to-date', status_result.status)
 
     def test_cmd_run_success_then_second_run_up_to_date(self):
-        """COMMAND: Second run of up-to-date task should be skipped."""
-        dep_file = self.create_file('dep.txt', 'content')
-        task = self.create_task('task1', file_dep=[dep_file])
+        """COMMAND: Second run of up-to-date task should be skipped.
 
-        cmd_run1, output1 = self._create_run_cmd([task])
-        result1 = cmd_run1._execute(output1)
+        This tests the REAL command entry point via parse_execute.
+        """
+        from doit.cmd_run import Run
+
+        dep_file = self.create_file('dep.txt', 'content')
+        task1 = self.create_task('task1', file_dep=[dep_file])
+
+        result1, output1, cmd1 = self._run_cmd_via_parse_execute(
+            Run, [task1], ['task1']
+        )
         self.assertEqual(0, result1)
 
         self.reopen_dep()
 
         task2 = self.create_task('task1', file_dep=[dep_file])
-        cmd_run2, output2 = self._create_run_cmd([task2])
-        result2 = cmd_run2._execute(output2)
+        result2, output2, cmd2 = self._run_cmd_via_parse_execute(
+            Run, [task2], ['task1']
+        )
         self.assertEqual(0, result2)
 
 
@@ -1059,43 +1108,24 @@ class _CommandRunFailure(DependencyCoverageTestBase):
     REGRESSION: 失败 run 后 remove_success 的 backend 差异被稳定记录.
     """
 
-    def _create_run_cmd(self, task_list, sel_tasks=None):
-        """Helper to create a Run command via CmdFactory.
-
-        Uses self.dep_manager directly instead of creating a new one,
-        to ensure state consistency.
-        """
-        from doit.cmd_run import Run
-        from tests.support import CmdFactory
-
-        output = StringIO()
-        cmd_run = CmdFactory(
-            Run,
-            outstream=output,
-            dep_file=self._dep_name,
-            dep_manager=self.dep_manager,
-            task_list=task_list,
-            sel_tasks=sel_tasks or [t.name for t in task_list]
-        )
-        return cmd_run, output
-
     def test_cmd_run_failure_removes_success(self):
         """COMMAND: Failed task removes previous success state.
 
-        This documents the EXISTING behavior: when a task fails,
-        remove_success is called. Different backends may have different
-        persistence timing for remove(), but this test captures the
-        current semantic without changing it.
+        This tests the REAL command entry point via parse_execute,
+        not just direct _execute calls.
 
-        Note: We use always=True to force the task to execute even
+        Note: We use --always-execute to force the task to execute even
         if it would otherwise be considered up-to-date. This is necessary
         to test the failure behavior.
         """
+        from doit.cmd_run import Run
+
         dep_file = self.create_file('dep.txt', 'content')
 
         task_success = self.create_task('task1', file_dep=[dep_file])
-        cmd_run1, output1 = self._create_run_cmd([task_success])
-        result1 = cmd_run1._execute(output1)
+        result1, output1, cmd1 = self._run_cmd_via_parse_execute(
+            Run, [task_success], ['task1']
+        )
         self.assertEqual(0, result1)
 
         self.reopen_dep()
@@ -1105,8 +1135,10 @@ class _CommandRunFailure(DependencyCoverageTestBase):
             raise Exception("intentional failure")
 
         task_fail = self.create_task('task1', [fail_action], file_dep=[dep_file])
-        cmd_run2, output2 = self._create_run_cmd([task_fail])
-        result2 = cmd_run2._execute(output2, always=True)
+        result2, output2, cmd2 = self._run_cmd_via_parse_execute(
+            Run, [task_fail], ['--always-execute', 'task1']
+        )
+        self.assertNotEqual(0, result2)
 
         self.reopen_dep()
         self.assert_task_not_in_db('task1',
@@ -1135,57 +1167,26 @@ class _CommandReadOnly(DependencyCoverageTestBase):
     REGRESSION: `list -s` / `info` 只读命令不会意外持久化新记录.
     """
 
-    def _create_list_cmd(self, task_list, status=False):
-        """Helper to create a List command via CmdFactory.
-
-        Uses self.dep_manager directly instead of creating a new one,
-        to ensure state consistency.
-        """
-        from doit.cmd_list import List
-        from tests.support import CmdFactory
-
-        output = StringIO()
-        cmd_list = CmdFactory(
-            List,
-            outstream=output,
-            dep_file=self._dep_name,
-            dep_manager=self.dep_manager,
-            task_list=task_list
-        )
-        return cmd_list, output
-
-    def _create_info_cmd(self, task_list):
-        """Helper to create an Info command via CmdFactory.
-
-        Uses self.dep_manager directly instead of creating a new one,
-        to ensure state consistency.
-        """
-        from doit.cmd_info import Info
-        from tests.support import CmdFactory
-
-        output = StringIO()
-        cmd_info = CmdFactory(
-            Info,
-            outstream=output,
-            dep_file=self._dep_name,
-            dep_manager=self.dep_manager,
-            task_list=task_list
-        )
-        return cmd_info, output
-
     def test_cmd_list_status_does_not_create_new_task(self):
         """COMMAND: list -s should NOT create new task records in DB.
+
+        This tests the REAL command entry point via parse_execute,
+        not just direct _execute calls.
 
         Read-only commands like `list -s` may call get_status to determine
         task status, but they should NOT persist new task records.
         """
+        from doit.cmd_list import List
+
         dep_file = self.create_file('dep.txt', 'content')
         task = self.create_task('task1', file_dep=[dep_file])
 
         self.assert_task_not_in_db('task1')
 
-        cmd_list, output = self._create_list_cmd([task], status=True)
-        cmd_list._execute(status=True)
+        result, output, cmd = self._run_cmd_via_parse_execute(
+            List, [task], ['--status']
+        )
+        self.assertEqual(0, result)
 
         self.reopen_dep()
         self.assert_task_not_in_db('task1',
@@ -1194,31 +1195,49 @@ class _CommandReadOnly(DependencyCoverageTestBase):
     def test_cmd_info_does_not_create_new_task(self):
         """COMMAND: info should NOT create new task records in DB.
 
+        This tests the REAL command entry point via parse_execute,
+        not just direct _execute calls.
+
         The info command shows task status but should not persist.
         """
+        from doit.cmd_info import Info
+
         dep_file = self.create_file('dep.txt', 'content')
         task = self.create_task('task1', file_dep=[dep_file])
 
         self.assert_task_not_in_db('task1')
 
-        cmd_info, output = self._create_info_cmd([task])
-        cmd_info._execute(['task1'])
+        result, output, cmd = self._run_cmd_via_parse_execute(
+            Info, [task], ['task1']
+        )
 
         self.reopen_dep()
         self.assert_task_not_in_db('task1',
             "info should NOT create new task records in DB")
 
     def test_cmd_list_status_on_existing_task(self):
-        """COMMAND: list -s on existing task works without modification."""
+        """COMMAND: list -s on existing task works without modification.
+
+        This tests the REAL command entry point via parse_execute.
+        """
+        from doit.cmd_list import List
+        from doit.cmd_run import Run
+
         dep_file = self.create_file('dep.txt', 'content')
         task = self.create_task('task1', file_dep=[dep_file])
 
-        self.dep_manager.save_success(task)
+        result1, output1, cmd1 = self._run_cmd_via_parse_execute(
+            Run, [task], ['task1']
+        )
+        self.assertEqual(0, result1)
+
         self.reopen_dep()
         self.assert_task_in_db('task1')
 
-        cmd_list, output = self._create_list_cmd([task], status=True)
-        cmd_list._execute(status=True)
+        result2, output2, cmd2 = self._run_cmd_via_parse_execute(
+            List, [task], ['--status']
+        )
+        self.assertEqual(0, result2)
 
         self.reopen_dep()
         self.assert_task_in_db('task1',
@@ -1247,70 +1266,37 @@ class _CommandForgetBehavior(DependencyCoverageTestBase):
     REGRESSION: `forget`/`remove_all` 通过命令入口后旧 task 不复活.
     """
 
-    def _create_forget_cmd(self, task_list, sel_tasks=None):
-        """Helper to create a Forget command via CmdFactory.
-
-        Uses self.dep_manager directly instead of creating a new one,
-        to ensure state consistency.
-        """
-        from doit.cmd_forget import Forget
-        from tests.support import CmdFactory
-
-        output = StringIO()
-        cmd_forget = CmdFactory(
-            Forget,
-            outstream=output,
-            dep_file=self._dep_name,
-            dep_manager=self.dep_manager,
-            task_list=task_list,
-            sel_tasks=sel_tasks or []
-        )
-        return cmd_forget, output
-
-    def _create_run_cmd(self, task_list, sel_tasks=None):
-        """Helper to create a Run command via CmdFactory.
-
-        Uses self.dep_manager directly instead of creating a new one,
-        to ensure state consistency.
-        """
-        from doit.cmd_run import Run
-        from tests.support import CmdFactory
-
-        output = StringIO()
-        cmd_run = CmdFactory(
-            Run,
-            outstream=output,
-            dep_file=self._dep_name,
-            dep_manager=self.dep_manager,
-            task_list=task_list,
-            sel_tasks=sel_tasks or [t.name for t in task_list]
-        )
-        return cmd_run, output
-
     def test_cmd_forget_all_then_new_run(self):
         """COMMAND: forget --all then new run: new tasks work, old tasks gone.
 
-        This tests the forget command entry point, not direct backend calls.
+        This tests the REAL command entry point via parse_execute,
+        not just direct _execute calls.
         """
+        from doit.cmd_forget import Forget
+        from doit.cmd_run import Run
+
         old_task = self.create_task('old_task')
 
-        cmd_run1, output1 = self._create_run_cmd([old_task])
-        result1 = cmd_run1._execute(output1)
+        result1, output1, cmd1 = self._run_cmd_via_parse_execute(
+            Run, [old_task], ['old_task']
+        )
         self.assertEqual(0, result1)
 
         self.reopen_dep()
         self.assert_task_in_db('old_task')
 
-        cmd_forget, output_f = self._create_forget_cmd([old_task])
-        cmd_forget._execute(False, False, True)
+        result_forget, output_f, cmd_forget = self._run_cmd_via_parse_execute(
+            Forget, [old_task], ['--all']
+        )
 
         self.reopen_dep()
         self.assert_task_not_in_db('old_task',
             "Old task should be forgotten")
 
         new_task = self.create_task('new_task')
-        cmd_run2, output2 = self._create_run_cmd([new_task])
-        result2 = cmd_run2._execute(output2)
+        result2, output2, cmd2 = self._run_cmd_via_parse_execute(
+            Run, [new_task], ['new_task']
+        )
         self.assertEqual(0, result2)
 
         self.reopen_dep()
@@ -1320,20 +1306,28 @@ class _CommandForgetBehavior(DependencyCoverageTestBase):
             "New task should exist")
 
     def test_cmd_forget_single_task(self):
-        """COMMAND: forget single task leaves others intact."""
+        """COMMAND: forget single task leaves others intact.
+
+        This tests the REAL command entry point via parse_execute.
+        """
+        from doit.cmd_forget import Forget
+        from doit.cmd_run import Run
+
         task1 = self.create_task('task1')
         task2 = self.create_task('task2')
 
-        cmd_run1, output1 = self._create_run_cmd([task1, task2])
-        result1 = cmd_run1._execute(output1)
+        result1, output1, cmd1 = self._run_cmd_via_parse_execute(
+            Run, [task1, task2], []
+        )
         self.assertEqual(0, result1)
 
         self.reopen_dep()
         self.assert_task_in_db('task1')
         self.assert_task_in_db('task2')
 
-        cmd_forget, output_f = self._create_forget_cmd([task1, task2], sel_tasks=['task1'])
-        cmd_forget._execute(False, False, False)
+        result_forget, output_f, cmd_forget = self._run_cmd_via_parse_execute(
+            Forget, [task1, task2], ['task1']
+        )
 
         self.reopen_dep()
         self.assert_task_not_in_db('task1',

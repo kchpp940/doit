@@ -415,3 +415,32 @@ class _BackendSmokeTest(DependencyHarnessMixin, unittest.TestCase):
         self.dep_manager._set('task1', 'dep1', 'value1')
         self.reopen_dep()
         self.assertEqual('value1', self.dep_manager._get('task1', 'dep1'))
+
+
+class FixedTaskLoader:
+    """A task loader that returns a fixed list of tasks.
+
+    This is useful for testing when you want to bypass the normal
+    task loading process (which involves inspect.getsourcelines).
+
+    It directly returns the task_list provided to it, without any
+    dependency on source code inspection.
+    """
+    API = 2
+    cmd_options = ()
+
+    def __init__(self, task_list, doit_config=None):
+        self.cmd_names = []
+        self.config = None
+        self.task_opts = None
+        self._task_list = task_list
+        self._doit_config = doit_config or {}
+
+    def setup(self, opt_values):
+        pass
+
+    def load_doit_config(self):
+        return self._doit_config
+
+    def load_tasks(self, cmd, pos_args):
+        return self._task_list
