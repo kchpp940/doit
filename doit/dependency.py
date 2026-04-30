@@ -589,6 +589,163 @@ class Dependency:
         """check if task is marked to be ignored"""
         return self._get(task.name, "ignore:")
 
+    def _evaluate_uptodate_item(self, utd, utd_args, utd_kwargs, task, tasks_dict):
+        """Evaluate a single uptodate item and return its result.
+
+        @param utd: uptodate item (callable, str, or value)
+        @param utd_args: positional arguments for uptodate
+        @param utd_kwargs: keyword arguments for uptodate
+        @param task: Task object
+        @param tasks_dict: dict with all tasks
+
+        @return: (Any) the result of evaluating the uptodate item.
+            - None: should be ignored
+            - Other values: truthy/falsy determines uptodate status
+        """
+        if hasattr(utd, '__call__'):
+            if isinstance(utd, UptodateCalculator):
+                utd.setup(self, tasks_dict)
+            spec_args = list(inspect.signature(utd).parameters.keys())
+            magic_args = []
+            for i, name in enumerate(spec_args):
+                if i == 0 and name == 'task':
+                    magic_args.append(task)
+                elif i == 1 and name == 'values':
+                    magic_args.append(self.get_values(task.name))
+            args = magic_args + utd_args
+            return utd(*args, **utd_kwargs)
+        elif isinstance(utd, str):
+            return subprocess.call(
+                utd, shell=True,
+                stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL) == 0
+        else:
+            return utd
+
+    def _evaluate_all_uptodate(self, task, tasks_dict, result):
+        """Phase 1: Evaluate all uptodate items.
+
+        - UptodateCalculator objects get setup() called
+        - Magic args 'task' (position 0) and 'values' (position 1) are injected
+        - String items are executed as shell commands (exit code 0 means True)
+        - All items are evaluated even if earlier ones return False
+        - Results of None are ignored (not added to uptodate_result_list)
+
+        @return: (list) uptodate_result_list - results excluding None
+        """
+        uptodate_result_list = []
+        for utd, utd_args, utd_kwargs in task.uptodate:
+            uptodate_result = self._evaluate_uptodate_item(
+                utd, utd_args, utd_kwargs, task, tasks_dict
+            )
+            if uptodate_result is None:
+                continue
+            uptodate_result_list.append(uptodate_result)
+            if not uptodate_result:
+                result.add_reason('uptodate_false', (utd, utd_args, utd_kwargs))
+        return uptodate_result_list
+
+    def _check_has_no_dependencies(self, task, uptodate_result_list, result):
+        """Phase 2: Check if task has no dependencies at all.
+
+        A task "has no dependencies" when:
+        - No file_dep, AND
+        - No uptodate results (uptodate returning None doesn't count)
+
+        @return: (bool) True if should short-circuit (only when get_log=False)
+        """
+        if not (task.file_dep or uptodate_result_list):
+            return result.set_reason('has_no_dependencies', True)
+        return False
+
+    def _check_targets(self, task, result):
+        """Phase 3: Check if all target files exist.
+
+        If any target is missing:
+        - task.dep_changed is set to ALL file_dep
+        - Status becomes 'run'
+
+        @return: (bool) True if should short-circuit (only when get_log=False)
+        """
+        for targ in task.targets:
+            if not self.checker.exists(targ):
+                task.dep_changed = list(task.file_dep)
+                if result.add_reason('missing_target', targ):
+                    return True
+        return False
+
+    def _check_checker_changed(self, task, result):
+        """Phase 4: Check if file checker type changed.
+
+        If checker changed (e.g., from Timestamp to MD5):
+        - task.dep_changed is set to ALL file_dep
+        - All saved data for this task is removed from DB (side effect!)
+          This prevents MD5Checker.get_state() optimization from reusing old state
+
+        @return: (bool) True if should short-circuit (only when get_log=False)
+        """
+        previous = self._get(task.name, 'checker:')
+        checker_name = self.checker.__class__.__name__
+        if previous and previous != checker_name:
+            task.dep_changed = list(task.file_dep)
+            self.remove(task.name)
+            if result.set_reason('checker_changed', (previous, checker_name)):
+                return True
+        return False
+
+    def _check_deps_list_changed(self, task, result, get_log):
+        """Phase 5: Check if file_dep list itself changed (add/remove items).
+
+        This compares the current task.file_dep set with what was saved
+        in the previous run. This phase:
+        - Does NOT set task.dep_changed (that's for content changes)
+        - Only sets status to 'run'
+        - When get_log=True, records added_file_dep and removed_file_dep
+
+        Note: This is purely about list membership changes, not content changes.
+        """
+        previous = self._get(task.name, 'deps:')
+        previous_set = set(previous) if previous else None
+        if previous_set and previous_set != task.file_dep:
+            if get_log:
+                added_files = sorted(list(task.file_dep - previous_set))
+                removed_files = sorted(list(previous_set - task.file_dep))
+                result.set_reason('added_file_dep', added_files)
+                result.set_reason('removed_file_dep', removed_files)
+            result.status = 'run'
+
+    def _check_file_deps_content(self, task, result):
+        """Phase 6: Check each file_dep for existence and content changes.
+
+        This phase handles two cases for each file_dep:
+        1. File doesn't exist -> error status with missing_file_dep reason
+        2. File exists but content changed (or never seen before) -> added to changed list
+
+        After this phase:
+        - task.dep_changed contains only the files with actual content changes
+        - Status is 'error' if any file_dep is missing
+        - Status is 'run' if any file_dep content changed
+        """
+        check_modified = self.checker.check_modified
+        changed = []
+        for dep in task.file_dep:
+            state = self._get(task.name, dep)
+            try:
+                file_stat = self.checker.info(dep)
+            except self.checker.CheckerError:
+                error_msg = "Dependent file '{}' does not exist.".format(dep)
+                result.error_reason = error_msg.format(dep)
+                if result.add_reason('missing_file_dep', dep, 'error'):
+                    return True
+            else:
+                if state is None or check_modified(dep, file_stat, state):
+                    changed.append(dep)
+        task.dep_changed = changed
+
+        if len(changed) > 0:
+            result.set_reason('changed_file_dep', changed)
+        return False
+
     def get_status(self, task, tasks_dict, get_log=False):
         """Check if task is up to date. set task.dep_changed
 
@@ -606,106 +763,51 @@ class Dependency:
         up-to-date if task not up-to-date because of a target, returned value
         will contain all file-dependencies regardless they are up-to-date
         or not.
+
+        Processing phases (in order):
+        1. Evaluate all uptodate items (callable, shell command, or value)
+           - All items evaluated even if earlier ones return False
+           - None results are ignored
+           - Magic args 'task' (pos 0) and 'values' (pos 1) injected for callables
+
+        2. Short-circuit after uptodate phase if get_log=False and status='run'
+           - This is the ONLY short-circuit that happens BEFORE checking other deps
+
+        3. Check has_no_dependencies (no file_dep AND no uptodate results)
+
+        4. Check targets exist (missing target sets dep_changed to ALL file_dep)
+
+        5. Check checker_changed (different checker type -> remove task from DB)
+           - Side effect: self.remove(task.name) is called
+
+        6. Check deps list changed (file_dep added/removed, not content)
+           - Does NOT set task.dep_changed (that's for content changes)
+
+        7. Check file_dep content (each file exists and content unchanged)
+           - Missing file_dep -> error status
+           - Content change -> added to task.dep_changed
         """
         result = DependencyStatus(get_log)
         task.dep_changed = []
 
-        # check uptodate bool/callables
-        uptodate_result_list = []
-        for utd, utd_args, utd_kwargs in task.uptodate:
-            # if parameter is a callable
-            if hasattr(utd, '__call__'):
-                # FIXME control verbosity, check error messages
-                # 1) setup object with global info all tasks
-                if isinstance(utd, UptodateCalculator):
-                    utd.setup(self, tasks_dict)
-                # 2) add magic positional args for `task` and `values`
-                # if present.
-                spec_args = list(inspect.signature(utd).parameters.keys())
-                magic_args = []
-                for i, name in enumerate(spec_args):
-                    if i == 0 and name == 'task':
-                        magic_args.append(task)
-                    elif i == 1 and name == 'values':
-                        magic_args.append(self.get_values(task.name))
-                args = magic_args + utd_args
-                # 3) call it and get result
-                uptodate_result = utd(*args, **utd_kwargs)
-            elif isinstance(utd, str):
-                uptodate_result = subprocess.call(
-                    utd, shell=True,
-                    stderr=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL) == 0
-            # parameter is a value
-            else:
-                uptodate_result = utd
+        uptodate_result_list = self._evaluate_all_uptodate(task, tasks_dict, result)
 
-            # None means uptodate was not really calculated and should be
-            # just ignored
-            if uptodate_result is None:
-                continue
-            uptodate_result_list.append(uptodate_result)
-            if not uptodate_result:
-                result.add_reason('uptodate_false', (utd, utd_args, utd_kwargs))
-
-        # any uptodate check is false
         if not get_log and result.status == 'run':
             return result
 
-        # no dependencies means it is never up to date.
-        if not (task.file_dep or uptodate_result_list):
-            if result.set_reason('has_no_dependencies', True):
-                return result
+        if self._check_has_no_dependencies(task, uptodate_result_list, result):
+            return result
 
+        if self._check_targets(task, result):
+            return result
 
-        # if target file is not there, task is not up to date
-        for targ in task.targets:
-            if not self.checker.exists(targ):
-                task.dep_changed = list(task.file_dep)
-                if result.add_reason('missing_target', targ):
-                    return result
+        if self._check_checker_changed(task, result):
+            return result
 
-        # check for modified file_dep checker
-        previous = self._get(task.name, 'checker:')
-        checker_name = self.checker.__class__.__name__
-        if previous and previous != checker_name:
-            task.dep_changed = list(task.file_dep)
-            # remove all saved values otherwise they might be re-used by
-            # some optimization on MD5Checker.get_state()
-            self.remove(task.name)
-            if result.set_reason('checker_changed', (previous, checker_name)):
-                return result
+        self._check_deps_list_changed(task, result, get_log)
 
-        # check for modified file_dep
-        previous = self._get(task.name, 'deps:')
-        previous_set = set(previous) if previous else None
-        if previous_set and previous_set != task.file_dep:
-            if get_log:
-                added_files = sorted(list(task.file_dep - previous_set))
-                removed_files = sorted(list(previous_set - task.file_dep))
-                result.set_reason('added_file_dep', added_files)
-                result.set_reason('removed_file_dep', removed_files)
-            result.status = 'run'
-
-        # list of file_dep that changed
-        check_modified = self.checker.check_modified
-        changed = []
-        for dep in task.file_dep:
-            state = self._get(task.name, dep)
-            try:
-                file_stat = self.checker.info(dep)
-            except self.checker.CheckerError:
-                error_msg = "Dependent file '{}' does not exist.".format(dep)
-                result.error_reason = error_msg.format(dep)
-                if result.add_reason('missing_file_dep', dep, 'error'):
-                    return result
-            else:
-                if state is None or check_modified(dep, file_stat, state):
-                    changed.append(dep)
-        task.dep_changed = changed
-
-        if len(changed) > 0:
-            result.set_reason('changed_file_dep', changed)
+        if self._check_file_deps_content(task, result):
+            return result
 
         return result
 
