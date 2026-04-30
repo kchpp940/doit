@@ -16,7 +16,7 @@ from doit.dependency import DatabaseException, UptodateCalculator
 from doit.dependency import FileChangedChecker, MD5Checker, TimestampChecker
 from doit.dependency import DependencyStatus
 from tests.support import get_abspath, backend_map, db_ext
-from tests.support import remove_all_db, DependencyFileMixin
+from tests.support import remove_all_db, DependencyFileMixin, DepManagerMixin, DepfileNameMixin
 
 # path to test folder (the original tests/ dir, where sample files live)
 TEST_PATH = os.path.join(os.path.dirname(__file__), '..', 'tests')
@@ -911,4 +911,458 @@ class TestGetStatusDbmNdbm(DependencyTestBase, _GetStatusTests, unittest.TestCas
     backend_name = 'dbm.ndbm'
 
 class TestGetStatusDbmDumb(DependencyTestBase, _GetStatusTests, unittest.TestCase):
+    backend_name = 'dbm.dumb'
+
+
+# ---------------------------------------------------------------------------
+# Boundary Regression Tests for Dependency/Runner/Commands Integration
+# ---------------------------------------------------------------------------
+
+class _UptodateExceptionPropagationTests:
+    """Scenario 1: uptodate callable 抛异常时的异常传播测试"""
+
+    def test_uptodate_callable_raises_get_status(self):
+        """get_status 直接调用时 uptodate callable 抛异常的行为"""
+
+        def raise_exception(task, values):
+            raise RuntimeError("uptodate check failed intentionally")
+
+        t1 = Task("t1", None, uptodate=[raise_exception])
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self.dep_manager.get_status(t1, {})
+        self.assertIn("uptodate check failed intentionally", str(ctx.exception))
+
+    def test_uptodate_callable_raises_via_selector_with_args(self):
+        """uptodate callable 带参数时抛异常"""
+
+        def raise_with_arg(task, values, msg):
+            raise ValueError(msg)
+
+        t1 = Task("t1", None, uptodate=[(raise_with_arg, ["custom error"])])
+
+        with self.assertRaises(ValueError) as ctx:
+            self.dep_manager.get_status(t1, {})
+        self.assertIn("custom error", str(ctx.exception))
+
+    def test_uptodate_callable_no_args_raises(self):
+        """uptodate callable 不带参数时抛异常"""
+
+        def raise_simple():
+            raise ZeroDivisionError("division by zero in uptodate")
+
+        t1 = Task("t1", None, uptodate=[raise_simple])
+
+        with self.assertRaises(ZeroDivisionError) as ctx:
+            self.dep_manager.get_status(t1, {})
+        self.assertIn("division by zero", str(ctx.exception))
+
+
+class TestUptodateExceptionJson(DependencyTestBase, _UptodateExceptionPropagationTests, unittest.TestCase):
+    backend_name = 'json'
+
+class TestUptodateExceptionSqlite(DependencyTestBase, _UptodateExceptionPropagationTests, unittest.TestCase):
+    backend_name = 'sqlite3'
+
+class TestUptodateExceptionDbmGnu(DependencyTestBase, _UptodateExceptionPropagationTests, unittest.TestCase):
+    backend_name = 'dbm.gnu'
+
+class TestUptodateExceptionDbmNdbm(DependencyTestBase, _UptodateExceptionPropagationTests, unittest.TestCase):
+    backend_name = 'dbm.ndbm'
+
+class TestUptodateExceptionDbmDumb(DependencyTestBase, _UptodateExceptionPropagationTests, unittest.TestCase):
+    backend_name = 'dbm.dumb'
+
+
+class _CheckerChangedSideEffectTests:
+    """Scenario 2: get_status(get_log=True) 时 checker_changed 的 remove 副作用测试"""
+
+    def test_checker_changed_removes_task_on_get_log_true(self):
+        """get_log=True 时 checker 变化会触发 remove 副作用"""
+        dep_path = get_abspath("data/dependency1")
+        with open(dep_path, "w") as f:
+            f.write("checker test content")
+
+        t1 = Task("t1", None, [dep_path])
+
+        from doit.dependency import TimestampChecker
+        self.dep_manager.checker = TimestampChecker()
+        self.dep_manager.save_success(t1)
+
+        self.assertTrue(self.dep_manager._in("t1"))
+        original_dep_state = self.dep_manager._get("t1", dep_path)
+        original_checker = self.dep_manager._get("t1", "checker:")
+        self.assertIsNotNone(original_dep_state)
+        self.assertEqual("TimestampChecker", original_checker)
+
+        from doit.dependency import MD5Checker
+        self.dep_manager.checker = MD5Checker()
+
+        result = self.dep_manager.get_status(t1, {}, get_log=True)
+        self.assertEqual('run', result.status)
+        self.assertIn('checker_changed', result.reasons)
+
+        dep_state_after = self.dep_manager._get("t1", dep_path)
+        checker_after = self.dep_manager._get("t1", "checker:")
+        self.assertIsNone(dep_state_after)
+        self.assertIsNone(checker_after)
+
+    def test_checker_changed_removes_task_on_get_log_false(self):
+        """get_log=False 时 checker 变化也会触发 remove 副作用"""
+        dep_path = get_abspath("data/dependency1")
+        with open(dep_path, "w") as f:
+            f.write("checker test content")
+
+        t1 = Task("t1", None, [dep_path])
+
+        from doit.dependency import TimestampChecker
+        self.dep_manager.checker = TimestampChecker()
+        self.dep_manager.save_success(t1)
+
+        self.assertTrue(self.dep_manager._in("t1"))
+        original_dep_state = self.dep_manager._get("t1", dep_path)
+        original_checker = self.dep_manager._get("t1", "checker:")
+        self.assertIsNotNone(original_dep_state)
+        self.assertEqual("TimestampChecker", original_checker)
+
+        from doit.dependency import MD5Checker
+        self.dep_manager.checker = MD5Checker()
+
+        result = self.dep_manager.get_status(t1, {}, get_log=False)
+        self.assertEqual('run', result.status)
+
+        dep_state_after = self.dep_manager._get("t1", dep_path)
+        checker_after = self.dep_manager._get("t1", "checker:")
+        self.assertIsNone(dep_state_after)
+        self.assertIsNone(checker_after)
+
+
+class TestCheckerChangedJson(DependencyTestBase, _CheckerChangedSideEffectTests, unittest.TestCase):
+    backend_name = 'json'
+
+class TestCheckerChangedSqlite(DependencyTestBase, _CheckerChangedSideEffectTests, unittest.TestCase):
+    backend_name = 'sqlite3'
+
+class TestCheckerChangedDbmGnu(DependencyTestBase, _CheckerChangedSideEffectTests, unittest.TestCase):
+    backend_name = 'dbm.gnu'
+
+class TestCheckerChangedDbmNdbm(DependencyTestBase, _CheckerChangedSideEffectTests, unittest.TestCase):
+    backend_name = 'dbm.ndbm'
+
+class TestCheckerChangedDbmDumb(DependencyTestBase, _CheckerChangedSideEffectTests, unittest.TestCase):
+    backend_name = 'dbm.dumb'
+
+
+class _TaskStateTransitionTests:
+    """Scenario 3: 任务成功->失败->成功的 db 状态测试"""
+
+    def test_success_fail_success_db_state(self):
+        """任务成功运行，再失败，再重新成功，close/reopen 后的状态"""
+        dep_path = get_abspath("data/dependency1")
+        with open(dep_path, "w") as f:
+            f.write("initial content")
+
+        t1 = Task("t1", None, [dep_path])
+        t1.result = "first_success"
+
+        self.dep_manager.save_success(t1)
+        self.assertTrue(self.dep_manager._in("t1"))
+        first_result_hash = self.dep_manager._get("t1", "result:")
+        self.assertIsNotNone(first_result_hash)
+
+        self.dep_manager.close()
+
+        reopened = Dependency(self.dep_manager.db_class, self.dep_manager.name)
+        self.assertTrue(reopened._in("t1"))
+        self.assertEqual(first_result_hash, reopened._get("t1", "result:"))
+
+        reopened.close()
+
+        reopened2 = Dependency(self.dep_manager.db_class, self.dep_manager.name)
+        t1_modified = Task("t1", None, [dep_path])
+        t1_modified.result = "second_success_after_failure"
+
+        reopened2.save_success(t1_modified)
+        second_result_hash = reopened2._get("t1", "result:")
+        self.assertNotEqual(first_result_hash, second_result_hash)
+
+        reopened2.close()
+
+        reopened3 = Dependency(self.dep_manager.db_class, self.dep_manager.name)
+        self.assertTrue(reopened3._in("t1"))
+        self.assertEqual(second_result_hash, reopened3._get("t1", "result:"))
+        reopened3.close()
+
+    def test_failure_does_not_overwrite_success_state(self):
+        """失败的任务执行不会覆盖之前成功的状态"""
+        dep_path = get_abspath("data/dependency1")
+        with open(dep_path, "w") as f:
+            f.write("content")
+
+        t1 = Task("t1", None, [dep_path])
+        t1.result = "success_result"
+
+        self.dep_manager.save_success(t1)
+        original_result = self.dep_manager._get("t1", "result:")
+        original_dep_state = self.dep_manager._get("t1", dep_path)
+
+        self.dep_manager.close()
+
+        reopened = Dependency(self.dep_manager.db_class, self.dep_manager.name)
+        self.assertEqual(original_result, reopened._get("t1", "result:"))
+        self.assertEqual(list(original_dep_state), list(reopened._get("t1", dep_path)))
+        reopened.close()
+
+
+class TestTaskStateTransitionJson(DependencyTestBase, _TaskStateTransitionTests, unittest.TestCase):
+    backend_name = 'json'
+
+class TestTaskStateTransitionSqlite(DependencyTestBase, _TaskStateTransitionTests, unittest.TestCase):
+    backend_name = 'sqlite3'
+
+class TestTaskStateTransitionDbmGnu(DependencyTestBase, _TaskStateTransitionTests, unittest.TestCase):
+    backend_name = 'dbm.gnu'
+
+class TestTaskStateTransitionDbmNdbm(DependencyTestBase, _TaskStateTransitionTests, unittest.TestCase):
+    backend_name = 'dbm.ndbm'
+
+class TestTaskStateTransitionDbmDumb(DependencyTestBase, _TaskStateTransitionTests, unittest.TestCase):
+    backend_name = 'dbm.dumb'
+
+
+class _TaskNameIsolationTests:
+    """Scenario 4: 子任务、普通任务、父任务的 dependency 记录隔离测试"""
+
+    def test_subtask_parent_child_isolation(self):
+        """'parent:child'、'parent_child'、'parent' 互不污染"""
+        dep1 = get_abspath("data/dependency1")
+        dep2 = get_abspath("data/dependency2")
+
+        with open(dep1, "w") as f:
+            f.write("dep1 content")
+        with open(dep2, "w") as f:
+            f.write("dep2 content")
+
+        parent = Task("parent", None, [dep1])
+        parent.result = "parent_result"
+        parent_sub = Task("parent:child", None, [dep2], subtask_of='parent')
+        parent_sub.result = "subtask_result"
+        parent_child = Task("parent_child", None, [dep1, dep2])
+        parent_child.result = "flat_result"
+
+        self.dep_manager.save_success(parent)
+        self.dep_manager.save_success(parent_sub)
+        self.dep_manager.save_success(parent_child)
+
+        self.assertTrue(self.dep_manager._in("parent"))
+        self.assertTrue(self.dep_manager._in("parent:child"))
+        self.assertTrue(self.dep_manager._in("parent_child"))
+
+        parent_result = self.dep_manager._get("parent", "result:")
+        sub_result = self.dep_manager._get("parent:child", "result:")
+        flat_result = self.dep_manager._get("parent_child", "result:")
+
+        self.assertIsNotNone(parent_result)
+        self.assertIsNotNone(sub_result)
+        self.assertIsNotNone(flat_result)
+        self.assertNotEqual(parent_result, sub_result)
+        self.assertNotEqual(parent_result, flat_result)
+        self.assertNotEqual(sub_result, flat_result)
+
+        parent_dep = self.dep_manager._get("parent", dep1)
+        sub_dep = self.dep_manager._get("parent:child", dep2)
+        flat_dep1 = self.dep_manager._get("parent_child", dep1)
+        flat_dep2 = self.dep_manager._get("parent_child", dep2)
+
+        self.assertIsNotNone(parent_dep)
+        self.assertIsNotNone(sub_dep)
+        self.assertIsNotNone(flat_dep1)
+        self.assertIsNotNone(flat_dep2)
+
+    def test_remove_one_does_not_affect_others(self):
+        """删除一个任务不影响其他同名模式的任务"""
+        parent = Task("parent", None)
+        parent_sub = Task("parent:child", None, subtask_of='parent')
+        parent_child = Task("parent_child", None)
+
+        self.dep_manager.save_success(parent)
+        self.dep_manager.save_success(parent_sub)
+        self.dep_manager.save_success(parent_child)
+
+        self.dep_manager.remove("parent")
+
+        self.assertFalse(self.dep_manager._in("parent"))
+        self.assertTrue(self.dep_manager._in("parent:child"))
+        self.assertTrue(self.dep_manager._in("parent_child"))
+
+        self.dep_manager.remove("parent:child")
+
+        self.assertFalse(self.dep_manager._in("parent:child"))
+        self.assertTrue(self.dep_manager._in("parent_child"))
+
+
+class TestTaskNameIsolationJson(DependencyTestBase, _TaskNameIsolationTests, unittest.TestCase):
+    backend_name = 'json'
+
+class TestTaskNameIsolationSqlite(DependencyTestBase, _TaskNameIsolationTests, unittest.TestCase):
+    backend_name = 'sqlite3'
+
+class TestTaskNameIsolationDbmGnu(DependencyTestBase, _TaskNameIsolationTests, unittest.TestCase):
+    backend_name = 'dbm.gnu'
+
+class TestTaskNameIsolationDbmNdbm(DependencyTestBase, _TaskNameIsolationTests, unittest.TestCase):
+    backend_name = 'dbm.ndbm'
+
+class TestTaskNameIsolationDbmDumb(DependencyTestBase, _TaskNameIsolationTests, unittest.TestCase):
+    backend_name = 'dbm.dumb'
+
+
+class _FileDepRemovalDuringExecutionTests:
+    """Scenario 5: file_dep 在执行中被删除的行为测试"""
+
+    def test_save_success_after_file_dep_deleted_raises(self):
+        """file_dep 在 save_success 时不存在会抛出 FileNotFoundError
+
+        当前实现行为：
+        - save_success 先写入 _values_:、result:、checker:
+        - 然后遍历 file_dep 获取状态，此时可能抛出 FileNotFoundError
+        - 部分数据可能已写入，所以 _in 可能返回 True
+        """
+        dep_path = get_abspath("data/dependency1")
+        with open(dep_path, "w") as f:
+            f.write("temporary content")
+
+        t1 = Task("t1", None, [dep_path])
+        t1.result = "test_result"
+
+        status = self.dep_manager.get_status(t1, {})
+        self.assertEqual('run', status.status)
+
+        os.remove(dep_path)
+        self.assertFalse(os.path.exists(dep_path))
+
+        with self.assertRaises(FileNotFoundError):
+            self.dep_manager.save_success(t1)
+
+        result_val = self.dep_manager._get("t1", "result:")
+        checker_val = self.dep_manager._get("t1", "checker:")
+        dep_val = self.dep_manager._get("t1", dep_path)
+
+        self.assertIsNotNone(result_val)
+        self.assertEqual("MD5Checker", checker_val)
+        self.assertIsNone(dep_val)
+
+    def test_get_status_before_file_removal(self):
+        """get_status 时文件存在，但 save_success 时文件不存在"""
+        dep_path = get_abspath("data/dependency1")
+        with open(dep_path, "w") as f:
+            f.write("content")
+
+        t1 = Task("t1", None, [dep_path])
+
+        status = self.dep_manager.get_status(t1, {})
+        self.assertEqual('run', status.status)
+        self.assertEqual([dep_path], t1.dep_changed)
+
+        os.remove(dep_path)
+
+        with self.assertRaises(FileNotFoundError):
+            self.dep_manager.save_success(t1)
+
+
+class TestFileDepRemovalJson(DependencyTestBase, _FileDepRemovalDuringExecutionTests, unittest.TestCase):
+    backend_name = 'json'
+
+class TestFileDepRemovalSqlite(DependencyTestBase, _FileDepRemovalDuringExecutionTests, unittest.TestCase):
+    backend_name = 'sqlite3'
+
+class TestFileDepRemovalDbmGnu(DependencyTestBase, _FileDepRemovalDuringExecutionTests, unittest.TestCase):
+    backend_name = 'dbm.gnu'
+
+class TestFileDepRemovalDbmNdbm(DependencyTestBase, _FileDepRemovalDuringExecutionTests, unittest.TestCase):
+    backend_name = 'dbm.ndbm'
+
+class TestFileDepRemovalDbmDumb(DependencyTestBase, _FileDepRemovalDuringExecutionTests, unittest.TestCase):
+    backend_name = 'dbm.dumb'
+
+
+class _RemoveAllContinuationTests:
+    """Scenario 6: remove_all() 后继续写入新任务的测试"""
+
+    def test_remove_all_then_write_new_tasks(self):
+        """remove_all() 后同一个进程继续写入新任务"""
+        t1 = Task("old_task_1", None)
+        t2 = Task("old_task_2", None)
+
+        self.dep_manager.save_success(t1)
+        self.dep_manager.save_success(t2)
+
+        self.assertTrue(self.dep_manager._in("old_task_1"))
+        self.assertTrue(self.dep_manager._in("old_task_2"))
+
+        self.dep_manager.remove_all()
+
+        self.assertFalse(self.dep_manager._in("old_task_1"))
+        self.assertFalse(self.dep_manager._in("old_task_2"))
+
+        new_t1 = Task("new_task_1", None)
+        new_t2 = Task("new_task_2", None)
+        self.dep_manager.save_success(new_t1)
+        self.dep_manager.save_success(new_t2)
+
+        self.assertTrue(self.dep_manager._in("new_task_1"))
+        self.assertTrue(self.dep_manager._in("new_task_2"))
+        self.assertFalse(self.dep_manager._in("old_task_1"))
+        self.assertFalse(self.dep_manager._in("old_task_2"))
+
+        self.dep_manager.close()
+
+        reopened = Dependency(self.dep_manager.db_class, self.dep_manager.name)
+
+        self.assertTrue(reopened._in("new_task_1"))
+        self.assertTrue(reopened._in("new_task_2"))
+        self.assertFalse(reopened._in("old_task_1"))
+        self.assertFalse(reopened._in("old_task_2"))
+
+        reopened.close()
+
+    def test_remove_all_mixed_operations(self):
+        """remove_all 前后的混合操作"""
+        for i in range(3):
+            t = Task(f"pre_task_{i}", None)
+            self.dep_manager.save_success(t)
+
+        self.dep_manager.remove_all()
+
+        for i in range(2):
+            t = Task(f"mid_task_{i}", None)
+            self.dep_manager.save_success(t)
+
+        self.dep_manager.remove_all()
+
+        final_t = Task("final_task", None)
+        self.dep_manager.save_success(final_t)
+
+        self.dep_manager.close()
+
+        reopened = Dependency(self.dep_manager.db_class, self.dep_manager.name)
+        self.assertTrue(reopened._in("final_task"))
+        self.assertFalse(reopened._in("pre_task_0"))
+        self.assertFalse(reopened._in("mid_task_0"))
+        reopened.close()
+
+
+class TestRemoveAllContinuationJson(DependencyTestBase, _RemoveAllContinuationTests, unittest.TestCase):
+    backend_name = 'json'
+
+class TestRemoveAllContinuationSqlite(DependencyTestBase, _RemoveAllContinuationTests, unittest.TestCase):
+    backend_name = 'sqlite3'
+
+class TestRemoveAllContinuationDbmGnu(DependencyTestBase, _RemoveAllContinuationTests, unittest.TestCase):
+    backend_name = 'dbm.gnu'
+
+class TestRemoveAllContinuationDbmNdbm(DependencyTestBase, _RemoveAllContinuationTests, unittest.TestCase):
+    backend_name = 'dbm.ndbm'
+
+class TestRemoveAllContinuationDbmDumb(DependencyTestBase, _RemoveAllContinuationTests, unittest.TestCase):
     backend_name = 'dbm.dumb'

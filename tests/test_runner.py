@@ -13,7 +13,7 @@ from doit.task import Task, DelayedLoader
 from doit.control import TaskDispatcher, ExecNode
 from doit import runner
 
-from tests.support import DepManagerMixin, DepfileNameMixin
+from tests.support import DepManagerMixin, DepfileNameMixin, DependencyFileMixin
 
 
 PLAT_IMPL = platform.python_implementation()
@@ -950,4 +950,99 @@ class TestMRunner_execute_task(DepManagerMixin, unittest.TestCase):
 class TestMThreadRunner_available(unittest.TestCase):
     def test_MThreadRunner_available(self):
         self.assertTrue(runner.MThreadRunner.available())
+
+
+class TestFullRunnerIntegration(DependencyFileMixin, DepManagerMixin, unittest.TestCase):
+    """完整的 runner 执行链路测试"""
+
+    def setUp(self):
+        super().setUp()
+        self.reporter = FakeReporter()
+
+    def test_runner_select_task_with_uptodate_exception(self):
+        """runner.select_task 中 uptodate callable 抛异常的传播"""
+        from doit import runner
+        from doit.control import ExecNode
+
+        def raise_in_uptodate(task, values):
+            raise RuntimeError("uptodate failed in runner")
+
+        task = Task("t1", None, uptodate=[raise_in_uptodate])
+        my_runner = runner.Runner(self.dep_manager, self.reporter)
+        node = ExecNode(task, None)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            my_runner.select_task(node, {})
+        self.assertIn("uptodate failed in runner", str(ctx.exception))
+
+    def test_runner_full_execution_persists_dependency(self):
+        """完整的任务执行后 dependency 状态持久化"""
+        from doit import runner
+        from doit.control import TaskDispatcher
+        from doit.task import Task
+
+        def simple_action():
+            return {'result_key': 'result_value'}
+
+        dep_path = self.dependency1
+        db_name = self.dep_manager.name
+        db_class = self.dep_manager.db_class
+        task = Task("executed_task", [simple_action], [dep_path])
+
+        my_runner = runner.Runner(self.dep_manager, self.reporter)
+        dispatcher = TaskDispatcher({'executed_task': task}, [], ['executed_task'])
+
+        my_runner.run_all(dispatcher)
+
+        reopened = Dependency(db_class, db_name)
+        self.assertTrue(reopened._in("executed_task"))
+        task_values = reopened.get_values("executed_task")
+        self.assertEqual({'result_key': 'result_value'}, task_values)
+        reopened.close()
+
+    def test_runner_failed_task_removes_success_record(self):
+        """失败的任务执行会移除之前的成功记录（当前实现行为）
+        
+        当前实现：
+        - process_task_error 调用 dep_manager.remove_success()
+        - remove_success() 调用 remove() 清除任务记录
+        """
+        from doit import runner
+        from doit.control import TaskDispatcher, ExecNode
+
+        def success_action():
+            return {'status': 'good'}
+
+        def fail_action():
+            raise Exception("task failed")
+
+        db_name = self.dep_manager.name
+        db_class = self.dep_manager.db_class
+
+        task_success = Task("my_task", [success_action])
+        my_runner = runner.Runner(self.dep_manager, self.reporter)
+        dispatcher1 = TaskDispatcher({'my_task': task_success}, [], ['my_task'])
+        my_runner.run_all(dispatcher1)
+
+        reopened = Dependency(db_class, db_name)
+        self.assertTrue(reopened._in("my_task"))
+        original_values = reopened.get_values("my_task")
+        self.assertEqual({'status': 'good'}, original_values)
+        reopened.close()
+
+        reopened2 = Dependency(db_class, db_name)
+        reporter2 = FakeReporter()
+        task_fail = Task("my_task", [fail_action])
+        my_runner2 = runner.Runner(reopened2, reporter2)
+        node = ExecNode(task_fail, None)
+
+        result = my_runner2.execute_task(task_fail)
+        my_runner2.process_task_result(node, result)
+
+        self.assertFalse(reopened2._in("my_task"))
+        reopened2.close()
+
+        reopened3 = Dependency(db_class, db_name)
+        self.assertFalse(reopened3._in("my_task"))
+        reopened3.close()
 

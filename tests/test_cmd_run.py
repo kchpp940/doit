@@ -164,3 +164,79 @@ class TestCmdRunOptions(DepfileNameMixin, unittest.TestCase):
         finally:
             if os.path.exists('test.out'):
                 os.remove('test.out')
+
+
+class TestCmdRunFullIntegration(DependencyFileMixin, DepfileNameMixin, unittest.TestCase):
+    """cmd_run 完整命令入口测试"""
+
+    def test_cmd_run_full_execution(self):
+        """通过 CmdFactory 执行完整的 run 命令，验证 dependency 状态"""
+        from io import StringIO
+        from doit.cmd_run import Run
+        from tests.support import CmdFactory
+        from doit.task import Task
+
+        def my_action():
+            return {'executed': True}
+
+        dep_path = self.dependency1
+        task = Task("run_test", [my_action], [dep_path])
+
+        output = StringIO()
+        cmd = CmdFactory(Run, outstream=output, backend='dbm',
+                         dep_file=self.depfile_name, task_list=[task])
+        result = cmd._execute(output)
+
+        self.assertEqual(0, result)
+
+        from doit.dependency import Dependency, DbmDB
+        dep = Dependency(DbmDB, self.depfile_name)
+        self.assertTrue(dep._in("run_test"))
+        self.assertEqual({'executed': True}, dep.get_values("run_test"))
+        dep.close()
+
+    def test_cmd_run_then_info_then_run_again(self):
+        """run -> info -> run 完整链路测试"""
+        from io import StringIO
+        from doit.cmd_run import Run
+        from doit.cmd_info import Info
+        from tests.support import CmdFactory
+        from doit.task import Task
+
+        call_count = [0]
+
+        def count_action():
+            call_count[0] += 1
+            return {'call_count': call_count[0]}
+
+        dep_path = self.dependency1
+        task = Task("chain_test", [count_action], [dep_path])
+
+        output1 = StringIO()
+        cmd_run1 = CmdFactory(Run, outstream=output1, backend='dbm',
+                              dep_file=self.depfile_name, task_list=[task])
+        cmd_run1._execute(output1)
+        self.assertEqual(1, call_count[0])
+
+        from doit.dependency import Dependency, DbmDB
+        dep1 = Dependency(DbmDB, self.depfile_name)
+        self.assertTrue(dep1._in("chain_test"))
+        self.assertEqual({'call_count': 1}, dep1.get_values("chain_test"))
+        dep1.close()
+
+        output2 = StringIO()
+        cmd_info = CmdFactory(Info, outstream=output2, backend='dbm',
+                              dep_file=self.depfile_name, task_list=[task])
+        cmd_info._execute(['chain_test'])
+        self.assertIn("chain_test", output2.getvalue())
+
+        output3 = StringIO()
+        cmd_run2 = CmdFactory(Run, outstream=output3, backend='dbm',
+                              dep_file=self.depfile_name, task_list=[task])
+        cmd_run2._execute(output3)
+        self.assertEqual(1, call_count[0])
+
+        dep2 = Dependency(DbmDB, self.depfile_name)
+        self.assertTrue(dep2._in("chain_test"))
+        self.assertEqual({'call_count': 1}, dep2.get_values("chain_test"))
+        dep2.close()

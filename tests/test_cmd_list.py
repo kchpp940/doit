@@ -171,3 +171,42 @@ class TestCmdListWithDeps(DependencyFileMixin, DepManagerMixin, unittest.TestCas
         cmd_list._execute()
         got = [line.strip() for line in output.getvalue().split('\n') if line]
         self.assertEqual('t做', got[0])
+
+
+class TestCmdListStatusInteraction(DependencyFileMixin, DepManagerMixin, unittest.TestCase):
+    """cmd_list -s 与 dependency 状态的交互"""
+
+    def test_list_status_triggers_checker_changed_remove(self):
+        """list -s 调用 get_status，checker_changed 会触发 remove 副作用
+
+        当前实现行为：
+        - checker_changed 时，无论 get_log 是 True 还是 False，都会调用 remove
+        - 这是因为 remove 调用在 set_reason 之前执行
+        """
+        from io import StringIO
+        from doit.cmd_list import List
+        from doit.dependency import TimestampChecker, MD5Checker
+        from tests.support import CmdFactory
+
+        dep_path = self.dependency1
+        task = Task("t1", None, [dep_path])
+
+        self.dep_manager.checker = TimestampChecker()
+        self.dep_manager.save_success(task)
+
+        self.assertTrue(self.dep_manager._in("t1"))
+        original_checker = self.dep_manager._get("t1", "checker:")
+        self.assertEqual("TimestampChecker", original_checker)
+
+        self.dep_manager.checker = MD5Checker()
+
+        output = StringIO()
+        cmd = CmdFactory(List, outstream=output,
+                         dep_manager=self.dep_manager, task_list=[task])
+        cmd._execute(status=True)
+
+        list_output = output.getvalue()
+        self.assertIn("t1", list_output)
+
+        checker_after = self.dep_manager._get("t1", "checker:")
+        self.assertIsNone(checker_after)
